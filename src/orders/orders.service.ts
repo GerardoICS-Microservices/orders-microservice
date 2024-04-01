@@ -8,9 +8,10 @@ import {
 import { CreateOrderDto } from './dto/create-order.dto';
 import { PrismaClient } from '@prisma/client';
 import { ClientProxy, RpcException } from '@nestjs/microservices';
-import { OrderPaginationDto, UpdateOrderStatusDto } from './dto';
+import { OrderPaginationDto, PaidOrderDto, UpdateOrderStatusDto } from './dto';
 import { NATS_SERVICE } from 'src/config';
-import { catchError, firstValueFrom } from 'rxjs';
+import { catchError, firstValueFrom, from } from 'rxjs';
+import { OrderWithProducts } from './interfaces/order-with-products.interface';
 
 @Injectable()
 export class OrdersService extends PrismaClient implements OnModuleInit {
@@ -28,7 +29,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
     //? 1. Get product ids
     const productIds = createOrderDto.items.map((item) => item.productId);
 
-    const products = await firstValueFrom(
+    const products$ = from(
       this.client.send({ cmd: 'validate_products' }, productIds).pipe(
         catchError((error) => {
           throw new RpcException({
@@ -38,6 +39,8 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
         }),
       ),
     );
+
+    const products = await firstValueFrom(products$);
 
     //? 2. Calculate product values
     const totalAmount = createOrderDto.items.reduce((acc, orderItem) => {
@@ -53,38 +56,49 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
     }, 0);
 
     //? 3. Create database transaction
-    const order = await this.order.create({
-      data: {
-        totalAmount,
-        totalItems,
-        OrderItem: {
-          createMany: {
-            data: createOrderDto.items.map((orderItem) => ({
-              price: products.find(
-                (product) => product.id === orderItem.productId,
-              ).price,
-              productId: orderItem.productId,
-              quantity: orderItem.quantity,
-            })),
+    const order$ = from(
+      this.order.create({
+        data: {
+          totalAmount,
+          totalItems,
+          OrderItem: {
+            createMany: {
+              data: createOrderDto.items.map((orderItem) => ({
+                price: products.find(
+                  (product) => product.id === orderItem.productId,
+                ).price,
+                productId: orderItem.productId,
+                quantity: orderItem.quantity,
+              })),
+            },
           },
         },
-      },
-      include: {
-        OrderItem: {
-          select: {
-            price: true,
-            quantity: true,
-            productId: true,
+        include: {
+          OrderItem: {
+            select: {
+              price: true,
+              quantity: true,
+              productId: true,
+            },
           },
         },
-      },
-    });
+      }),
+    ).pipe(
+      catchError((error) => {
+        throw new RpcException({
+          message: error.message,
+          status: HttpStatus.BAD_REQUEST,
+        });
+      }),
+    );
+
+    const order = await firstValueFrom(order$);
 
     return {
       ...order,
       OrderItem: order.OrderItem.map((item) => ({
         ...item,
-        product: products.find((product) => product.id === item.productId),
+        name: products.find((product) => product.id === item.productId).name,
       })),
     };
   }
@@ -173,5 +187,54 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
       where: { id },
       data: { status },
     });
+  }
+
+  async createPaymentSession(order: OrderWithProducts) {
+    const paymentSession = await firstValueFrom(
+      this.client
+        .send('create.payment.session', {
+          orderId: order.id,
+          currency: 'usd',
+          items: order.OrderItem.map((item) => ({
+            name: item.name,
+            price: item.price,
+            quantity: item.quantity,
+          })),
+        })
+        .pipe(
+          catchError((error) => {
+            throw new RpcException({
+              message: error.message,
+              status: HttpStatus.BAD_REQUEST,
+            });
+          }),
+        ),
+    );
+
+    return paymentSession;
+  }
+
+  async paidOrder(paidOrderDto: PaidOrderDto) {
+    this.logger.log('Order paid');
+    this.logger.log(paidOrderDto);
+
+    const order = await this.order.update({
+      where: { id: paidOrderDto.orderId },
+      data: {
+        status: 'PAID',
+        paid: true,
+        paidAt: new Date(),
+        stripeChargeId: paidOrderDto.stripePaymentId,
+
+        //?Relation
+        OrderReceipt: {
+          create: {
+            receiptUrl: paidOrderDto.receiptUrl,
+          },
+        },
+      },
+    });
+
+    return order;
   }
 }
